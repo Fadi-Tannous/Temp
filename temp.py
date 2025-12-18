@@ -15,7 +15,7 @@ def validate_batch_parameters(payload: Union[Dict[str, Any], object]) -> bool:
     
     # S3: s3://<bucket>/<key>
     s3_pattern = r"^s3://[a-z0-9][a-z0-9.-]+[a-z0-9]/(?:.*)$"
-    
+    sqs_url_pattern = r"^https://sqs\.[a-z0-9-]+\.amazonaws\.com/[0-9]{12}/[a-zA-Z0-9_-]+(?:\.fifo)?$"
     # IAM Role ARN: arn:partition:iam::account-id:role/role-name
     # Enforces 'iam' service, empty region, and 'role' resource type
     role_arn_pattern = r"^arn:aws[a-zA-Z-]*:iam::[0-9]{12}:role/.+$"
