@@ -1,123 +1,217 @@
-import re
-from typing import Dict, Any, Union
+import boto3
+import os
+import zipfile
+import json
+import shutil
+import uuid
+from urllib.parse import urlparse
+from datetime import datetime
 
-def validate_batch_parameters(payload: Union[Dict[str, Any], object]) -> bool:
+# Assumptions for external dependencies based on context
+# from your_app import EnvValues, query_dynamodb, update_dynamodb_entry
+
+@staticmethod
+def async_batch_job(job_data):
     """
-    Validates batch parameters for S3 paths, IAM Role ARNs, and access type dependencies.
+    Executes the batch processing workflow:
+    1. Download & Unzip -> 2. Process -> 3. Zip & Upload -> 4. Notify
     """
+    print(f"Starting Job {job_data.get('id')}...")
     
-    def get_val(key):
-        if isinstance(payload, dict):
-            return payload.get(key, "")
-        return getattr(payload, key, "")
+    # --- Helper: Session Management ---
+    def get_session(access_type, role_arn):
+        """Creates a session, assuming a role if needed."""
+        if access_type == "assume_role" and role_arn:
+            sts = boto3.client('sts')
+            creds = sts.assume_role(RoleArn=role_arn, RoleSessionName=f"Job-{job_data['id']}")['Credentials']
+            return boto3.Session(
+                aws_access_key_id=creds['AccessKeyId'],
+                aws_secret_access_key=creds['SecretAccessKey'],
+                aws_session_token=creds['SessionToken']
+            )
+        return boto3.Session()
 
-    # --- Regex Patterns ---
-    
-    # S3: s3://<bucket>/<key>
-    s3_pattern = r"^s3://[a-z0-9][a-z0-9.-]+[a-z0-9]/(?:.*)$"
-    sqs_url_pattern = r"^https://sqs\.[a-z0-9-]+\.amazonaws\.com/[0-9]{12}/[a-zA-Z0-9_-]+(?:\.fifo)?$"
-    # IAM Role ARN: arn:partition:iam::account-id:role/role-name
-    # Enforces 'iam' service, empty region, and 'role' resource type
-    role_arn_pattern = r"^arn:aws[a-zA-Z-]*:iam::[0-9]{12}:role/.+$"
-    
-    # SQS ARN: arn:partition:sqs:region:account-id:queue-name
-    sqs_arn_pattern = r"^arn:aws[a-zA-Z-]*:sqs:[a-z0-9\-]+:[0-9]{12}:.+$"
+    # --- Helper: Parse S3 URI ---
+    def parse_s3(uri):
+        p = urlparse(uri)
+        return p.netloc, p.path.lstrip('/')
 
-    # --- Extract Values ---
-    input_s3 = get_val("inputsS3Path")
-    output_s3 = get_val("outputS3Path")
-    input_access = get_val("inputAccessType")
-    input_role_arn = get_val("inputAssumeRoleARN")
-    output_access = get_val("outputAccessType")
-    output_role_arn = get_val("outputAssumeRoleARN")
-    comp_s3 = get_val("completionS3TriggerPath")
-    comp_sqs = get_val("completionSQSQueue")
+    # Setup Sessions
+    # Note: DynamoDB & SNS usually use the Service's own Role (Env variables), 
+    # while S3 Input/Output might use Customer Roles.
+    service_session = boto3.Session() 
+    input_session = get_session(job_data.get('inputAccessType'), job_data.get('inputAssumeRoleARN'))
+    output_session = get_session(job_data.get('outputAccessType'), job_data.get('outputAssumeRoleARN'))
 
-    # --- Validations ---
+    # Local Scratch Paths
+    job_id = job_data['id']
+    base_dir = f"/tmp/{job_id}"
+    input_dir = f"{base_dir}/input"
+    extract_dir = f"{base_dir}/extracted"
+    output_dir = f"{base_dir}/processed"
+    os.makedirs(extract_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
 
-    # 1. Check S3 Path Syntax
-    if not input_s3 or not re.match(s3_pattern, str(input_s3)):
-        raise ValueError(f"Invalid inputsS3Path: '{input_s3}'. Must be a valid s3:// URI.")
-    
-    if not output_s3 or not re.match(s3_pattern, str(output_s3)):
-        raise ValueError(f"Invalid outputS3Path: '{output_s3}'. Must be a valid s3:// URI.")
-
-    # 2. Input Access Type Validation (Specific IAM Role Check)
-    if input_access == "assume_role":
-        if not input_role_arn:
-            raise ValueError("inputAssumeRoleARN is required when inputAccessType is 'assume_role'.")
-        if not re.match(role_arn_pattern, str(input_role_arn)):
-            raise ValueError(f"Invalid inputAssumeRoleARN: '{input_role_arn}'. Must be a valid IAM Role ARN (e.g., arn:aws:iam::...:role/...).")
-
-    # 3. Output Access Type Validation (Specific IAM Role Check)
-    if output_access == "assume_role":
-        if not output_role_arn:
-            raise ValueError("outputAssumeRoleARN is required when outputAccessType is 'assume_role'.")
-        if not re.match(role_arn_pattern, str(output_role_arn)):
-            raise ValueError(f"Invalid outputAssumeRoleARN: '{output_role_arn}'. Must be a valid IAM Role ARN (e.g., arn:aws:iam::...:role/...).")
-
-    # 4. Completion S3 Trigger Path
-    if comp_s3 and str(comp_s3).strip():
-        if not re.match(s3_pattern, str(comp_s3)):
-            raise ValueError(f"Invalid completionS3TriggerPath: '{comp_s3}'. Must be a valid s3:// URI.")
-
-    # 5. Completion SQS Queue ARN
-    if comp_sqs and str(comp_sqs).strip():
-        if not re.match(sqs_arn_pattern, str(comp_sqs)):
-            raise ValueError(f"Invalid completionSQSQueue: '{comp_sqs}'. Must be a valid SQS ARN.")
-
-    return True
-
-import os, secrets, json
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, Depends, HTTPException, Request, Header
-from fastapi.responses import StreamingResponse
-from openai import AsyncAzureOpenAI
-
-# State & Config
-state = {"key": ""}
-client = AsyncAzureOpenAI(
-    api_key=os.getenv("UPSTREAM_API_KEY", "dummy"),
-    api_version=os.getenv("OPENAI_API_VERSION", "2023-05-15"),
-    azure_endpoint=os.getenv("UPSTREAM_ENDPOINT", "https://your-custom-gateway.com")
-)
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    state["key"] = secrets.token_urlsafe(32)
-    print(f"\n🔑 API KEY:\nBearer {state['key']}\n")
-    yield
-
-app = FastAPI(lifespan=lifespan)
-
-async def auth(authorization: str = Header(None)):
-    if not authorization or authorization.replace("Bearer ", "") != state["key"]:
-        raise HTTPException(401, "Invalid Key")
-
-@app.get("/v1/models")
-async def list_models(_: str = Depends(auth), provider: str = Header(None)):
-    if provider not in ["bedrock", "azure"]:
-        raise HTTPException(400, "Header 'provider' must be 'bedrock' or 'azure'")
-    return {"object": "list", "data": [{"id": "gpt-4", "object": "model", "created": 0, "owned_by": "openai"}]}
-
-async def stream_gen(body):
     try:
-        async for chunk in await client.chat.completions.create(**body):
-            yield f"data: {chunk.model_dump_json()}\n\n"
-        yield "data: [DONE]\n\n"
-    except Exception as e:
-        yield f"data: {json.dumps({'error': str(e)})}\n\n"
+        # ====================================================
+        # 1. Download Specified Zip from S3
+        # ====================================================
+        input_bucket, input_key = parse_s3(job_data['inputsS3Path'])
+        local_zip_path = f"{input_dir}/input_data.zip"
+        
+        # Ensure input dir exists
+        os.makedirs(input_dir, exist_ok=True)
+        
+        print(f"Downloading inputs from {input_bucket}/{input_key}...")
+        input_session.client('s3').download_file(input_bucket, input_key, local_zip_path)
 
-@app.post("/v1/chat/completions")
-async def proxy(req: Request, _: str = Depends(auth)):
-    try:
-        body = await req.json()
-        if body.get("stream"):
-            return StreamingResponse(stream_gen(body), media_type="text/event-stream")
-        return (await client.chat.completions.create(**body)).model_dump()
-    except Exception as e:
-        raise HTTPException(500, str(e))
+        # ====================================================
+        # 2. Unzip File
+        # ====================================================
+        print("Unzipping files...")
+        with zipfile.ZipFile(local_zip_path, 'r') as zip_ref:
+            zip_ref.extractall(extract_dir)
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+        # Get list of files to process (ignoring hidden files/folders)
+        files_to_process = [
+            f for f in os.listdir(extract_dir) 
+            if os.path.isfile(os.path.join(extract_dir, f)) and not f.startswith('.')
+        ]
+        total_docs = len(files_to_process)
+
+        # ====================================================
+        # 3. Update DynamoDB Job (Specify Document Count)
+        # ====================================================
+        # Assuming helper function 'update_dynamodb_entry' exists
+        # update_dynamodb_entry(EnvValues.BATCH_TABLE, job_id, {"total_doc_count": total_docs})
+        print(f"Total documents to process: {total_docs}")
+
+        # ====================================================
+        # 4. Loop & Process (Extraction/Classification)
+        # ====================================================
+        processed_count = 0
+        
+        for filename in files_to_process:
+            file_path = os.path.join(extract_dir, filename)
+            
+            # --- MOCK PROCESSING START ---
+            # Replace this with your actual classification/extraction logic
+            # result = run_inference(file_path, job_data['jobType'])
+            result_data = f"Processed {filename} with jobType {job_data['jobType']}"
+            
+            # Write result to output directory
+            with open(os.path.join(output_dir, f"{filename}.txt"), "w") as f:
+                f.write(result_data)
+            # --- MOCK PROCESSING END ---
+
+            processed_count += 1
+            
+            # Update DynamoDB periodically (or every time if scale allows)
+            # update_dynamodb_entry(EnvValues.BATCH_TABLE, job_id, {"completed_doc_count": processed_count})
+
+        # ====================================================
+        # 5. Zip Result and Store back to Output S3
+        # ====================================================
+        output_zip_name = f"results_{job_id}.zip"
+        local_output_zip = f"{base_dir}/{output_zip_name}"
+        
+        print("Zipping results...")
+        with zipfile.ZipFile(local_output_zip, 'w') as zipf:
+            for root, _, files in os.walk(output_dir):
+                for file in files:
+                    zipf.write(
+                        os.path.join(root, file), 
+                        os.path.relpath(os.path.join(root, file), output_dir)
+                    )
+
+        # Upload to S3
+        out_bucket, out_prefix = parse_s3(job_data['outputS3Path'])
+        # Handle if outputS3Path is a folder or full key
+        if not out_prefix.endswith('.zip'):
+             out_key = f"{out_prefix.rstrip('/')}/{output_zip_name}"
+        else:
+             out_key = out_prefix
+
+        print(f"Uploading results to {out_bucket}/{out_key}...")
+        output_session.client('s3').upload_file(local_output_zip, out_bucket, out_key)
+        final_s3_path = f"s3://{out_bucket}/{out_key}"
+
+        # ====================================================
+        # 6. Update DynamoDB (Completion)
+        # ====================================================
+        completion_update = {
+            "status": "completed",
+            "completed_s3_path": final_s3_path,
+            "completed_at": datetime.utcnow().isoformat()
+        }
+        # update_dynamodb_entry(EnvValues.BATCH_TABLE, job_id, completion_update)
+
+        # ====================================================
+        # 7. Issue SNS Email Notification
+        # ====================================================
+        # Requires looking up the SNS Topic ARN for the App ID (Mocked here)
+        sns_topic_arn = "arn:aws:sns:region:account:topic-name" 
+        try:
+            sns = service_session.client('sns')
+            sns.publish(
+                TopicArn=sns_topic_arn,
+                Subject=f"Batch Job {job_id} Completed",
+                Message=f"Your batch job for {job_data['appId']} is done.\nResults: {final_s3_path}"
+            )
+        except Exception as e:
+            print(f"Warning: Failed to send SNS: {e}")
+
+        # ====================================================
+        # 8. Issue SQS Message (If configured)
+        # ====================================================
+        sqs_queue_url = job_data.get('completionSQSQueue') # Note: Assuming URL, convert if ARN
+        if sqs_queue_url:
+            try:
+                # Use Output Session? Or Service Session? 
+                # Usually Output Session if writing to Customer Queue.
+                sqs = output_session.client('sqs')
+                
+                # If the provided value is an ARN, convert to URL first (Logic from previous turns)
+                if sqs_queue_url.startswith("arn:"):
+                     # Simple ARN to URL converter for this scope
+                     parts = sqs_queue_url.split(':')
+                     sqs_queue_url = f"https://sqs.{parts[3]}.amazonaws.com/{parts[4]}/{parts[5]}"
+
+                sqs.send_message(
+                    QueueUrl=sqs_queue_url,
+                    MessageBody=json.dumps({
+                        "jobId": job_id,
+                        "status": "completed",
+                        "output": final_s3_path
+                    })
+                )
+            except Exception as e:
+                print(f"Warning: Failed to send SQS: {e}")
+
+        # ====================================================
+        # 9. Create S3 Trigger File (If configured)
+        # ====================================================
+        trigger_path = job_data.get('completionS3TriggerPath')
+        if trigger_path:
+            try:
+                trig_bucket, trig_key = parse_s3(trigger_path)
+                # Ensure we have a valid object key, not just a folder
+                if trig_key.endswith('/'):
+                    trig_key += "_SUCCESS"
+                
+                output_session.client('s3').put_object(
+                    Bucket=trig_bucket,
+                    Key=trig_key,
+                    Body=json.dumps({"jobId": job_id, "status": "completed"})
+                )
+            except Exception as e:
+                print(f"Warning: Failed to create S3 trigger: {e}")
+
+    except Exception as e:
+        print(f"Job Failed: {e}")
+        # update_dynamodb_entry(EnvValues.BATCH_TABLE, job_id, {"status": "failed", "error": str(e)})
+        raise e
+        
+    finally:
+        # Cleanup /tmp
+        shutil.rmtree(base_dir, ignore_errors=True)
