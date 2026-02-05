@@ -26,16 +26,21 @@ def get_mcp_tools():
         return result["result"].get("tools", [])
     return []
 
-def generate_openapi(tools):
-    """Wraps MCP tools into a valid OpenAPI 3.0.0 JSON structure."""
+import json
+
+def generate_openapi_from_mcp(url: str, tools: list) -> str:
+    """
+    Converts MCP tool definitions into a valid OpenAPI 3.0.0 JSON string
+    mapped to the AWS AgentCore /invocations entry point.
+    """
+    # Initialize the base OpenAPI structure
     openapi_spec = {
         "openapi": "3.0.0",
         "info": {
-            "title": "FastMCP AgentCore Gateway",
-            "version": "1.0.0",
-            "description": "Generated from live AgentCore /invocations discovery."
+            "title": "FastMCP Server Specification",
+            "version": "1.0.0"
         },
-        "servers": [{"url": GATEWAY_URL.replace("/invocations", "")}],
+        "servers": [{"url": url.rstrip("/")}],
         "paths": {
             "/invocations": {
                 "post": {
@@ -49,7 +54,14 @@ def generate_openapi(tools):
                         }
                     },
                     "responses": {
-                        "200": {"description": "Successful tool execution"}
+                        "200": {
+                            "description": "Successful operation",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/McpResponse"}
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -58,16 +70,29 @@ def generate_openapi(tools):
             "schemas": {
                 "McpRequest": {
                     "type": "object",
+                    "required": ["jsonrpc", "method", "params", "id"],
                     "properties": {
                         "jsonrpc": {"type": "string", "enum": ["2.0"]},
-                        "method": {"type": "string", "example": "tools/call"},
+                        "method": {"type": "string", "enum": ["tools/call"]},
                         "params": {
                             "type": "object",
+                            "required": ["name", "arguments"],
                             "properties": {
-                                "name": {"type": "string", "description": "The tool name"},
+                                "name": {
+                                    "type": "string",
+                                    "enum": [t["name"] for t in tools]
+                                },
                                 "arguments": {"type": "object"}
                             }
                         },
+                        "id": {"type": "string"}
+                    }
+                },
+                "McpResponse": {
+                    "type": "object",
+                    "properties": {
+                        "jsonrpc": {"type": "string"},
+                        "result": {"type": "object"},
                         "id": {"type": "string"}
                     }
                 }
@@ -75,12 +100,17 @@ def generate_openapi(tools):
         }
     }
 
-    # Optional: You can add specific tool schemas to 'components' for better documentation
+    # Inject individual tool schemas into components for reference/documentation
     for tool in tools:
-        schema_name = f"Tool_{tool['name']}"
-        openapi_spec["components"]["schemas"][schema_name] = tool.get("inputSchema", {})
+        schema_name = f"ToolInput_{tool['name']}"
+        # MCP inputSchema is typically a valid JSON Schema (subset of OpenAPI)
+        openapi_spec["components"]["schemas"][schema_name] = tool.get("inputSchema", {"type": "object"})
 
-    return openapi_spec
+    return json.dumps(openapi_spec, indent=2)
+
+# Usage Example:
+# tools_from_api = [{"name": "add", "inputSchema": {...}}, ...]
+# print(generate_openapi_from_mcp("https://api.example.com", tools_from_api))
 
 if __name__ == "__main__":
     try:
