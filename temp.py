@@ -1,52 +1,46 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'Captures ECS events for a specific cluster and routes them to CloudWatch Logs.'
 
 Parameters:
-  ClusterName:
+  LogGroupName:
     Type: String
-    Description: 'The name of the ECS cluster to capture events for.'
+    Description: Name of the existing CloudWatch Log Group to monitor
+  AlertEmail:
+    Type: String
+    Description: Email address to receive the alarm notification
 
 Resources:
-  ECSEventsLogGroup:
-    Type: AWS::Logs::LogGroup
+  # 1. SNS Topic & Email Subscription
+  AlarmSNSTopic:
+    Type: AWS::SNS::Topic
     Properties:
-      LogGroupName: !Sub "/aws/events/ecs/${ClusterName}"
-      RetentionInDays: 30
+      Subscription:
+        - Endpoint: !Ref AlertEmail
+          Protocol: email
 
-  EventBridgeLogsResourcePolicy:
-    Type: AWS::Logs::ResourcePolicy
+  # 2. Metric Filter to watch for the exact phrase
+  ArtifactoryErrorMetricFilter:
+    Type: AWS::Logs::MetricFilter
     Properties:
-      PolicyName: !Sub "${AWS::StackName}-EventBridgeEcsLogsPolicy"
-      PolicyDocument: !Sub >
-        {
-          "Version": "2012-10-17",
-          "Statement": [
-            {
-              "Effect": "Allow",
-              "Principal": {
-                "Service": "events.amazonaws.com"
-              },
-              "Action": [
-                "logs:CreateLogStream",
-                "logs:PutLogEvents"
-              ],
-              "Resource": "${ECSEventsLogGroup.Arn}:*"
-            }
-          ]
-        }
+      LogGroupName: !Ref LogGroupName
+      FilterPattern: '"Artifactory Sync - Error"'
+      MetricTransformations:
+        - MetricName: ArtifactorySyncErrorCount
+          MetricNamespace: Custom/Artifactory
+          MetricValue: "1"
 
-  ECSEventsRule:
-    Type: AWS::Events::Rule
+  # 3. CloudWatch Alarm triggered by the metric
+  ArtifactoryErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
     Properties:
-      Name: !Sub "${ClusterName}-ecs-events"
-      Description: !Sub "Captures events for the ${ClusterName} ECS cluster to CloudWatch"
-      EventPattern:
-        source:
-          - "aws.ecs"
-        detail:
-          clusterArn:
-            - !Sub "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${ClusterName}"
-      State: ENABLED
-      Targets:
-        - Arn: !GetAtt ECSEventsLogGroup.Arn
-          Id: "EcsEventsLogTarget"
+      AlarmName: Artifactory-Sync-Error-Alarm
+      AlarmDescription: "Triggers if 'Artifactory Sync - Error' is found in logs"
+      MetricName: ArtifactorySyncErrorCount
+      Namespace: Custom/Artifactory
+      Statistic: Sum
+      Period: 300 # Evaluates every 5 minutes
+      EvaluationPeriods: 1
+      Threshold: 1 # Alarms on 1 or more errors
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmSNSTopic
