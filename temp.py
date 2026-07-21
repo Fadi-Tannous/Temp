@@ -3,43 +3,59 @@ AWSTemplateFormatVersion: '2010-09-09'
 Parameters:
   LogGroupName:
     Type: String
-    Description: Name of the existing CloudWatch Log Group to monitor
-  AlertEmail:
+  AlertEmail1:
     Type: String
-    Description: Email address to receive the alarm notification
+    Description: Primary email address (Required)
+  AlertEmail2:
+    Type: String
+    Description: Secondary email address (Optional)
+    Default: ""
+
+Conditions:
+  HasSecondEmail: !Not [!Equals [!Ref AlertEmail2, ""]]
 
 Resources:
-  # 1. SNS Topic & Email Subscription
   AlarmSNSTopic:
     Type: AWS::SNS::Topic
-    Properties:
-      Subscription:
-        - Endpoint: !Ref AlertEmail
-          Protocol: email
 
-  # 2. Metric Filter to watch for the exact phrase
-  ArtifactoryErrorMetricFilter:
+  # Primary Email Subscription
+  AlarmSubscription1:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlarmSNSTopic
+      Endpoint: !Ref AlertEmail1
+      Protocol: email
+
+  # Optional Secondary Email Subscription
+  AlarmSubscription2:
+    Condition: HasSecondEmail
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlarmSNSTopic
+      Endpoint: !Ref AlertEmail2
+      Protocol: email
+
+  # Uses '?' for OR logic: Matches either exact phrase
+  SyncErrorMetricFilter:
     Type: AWS::Logs::MetricFilter
     Properties:
       LogGroupName: !Ref LogGroupName
-      FilterPattern: '"Artifactory Sync - Error"'
+      FilterPattern: '?"Artifactory Sync - Error" ?"Git Sync - Error"'
       MetricTransformations:
-        - MetricName: ArtifactorySyncErrorCount
-          MetricNamespace: Custom/Artifactory
+        - MetricName: SyncErrorCount
+          MetricNamespace: Custom/SyncErrors
           MetricValue: "1"
 
-  # 3. CloudWatch Alarm triggered by the metric
-  ArtifactoryErrorAlarm:
+  SyncErrorAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
-      AlarmName: Artifactory-Sync-Error-Alarm
-      AlarmDescription: "Triggers if 'Artifactory Sync - Error' is found in logs"
-      MetricName: ArtifactorySyncErrorCount
-      Namespace: Custom/Artifactory
+      AlarmName: Sync-Error-Alarm
+      MetricName: SyncErrorCount
+      Namespace: Custom/SyncErrors
       Statistic: Sum
-      Period: 300 # Evaluates every 5 minutes
+      Period: 300 
       EvaluationPeriods: 1
-      Threshold: 1 # Alarms on 1 or more errors
+      Threshold: 1
       ComparisonOperator: GreaterThanOrEqualToThreshold
       TreatMissingData: notBreaching
       AlarmActions:
