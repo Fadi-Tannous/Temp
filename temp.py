@@ -1,1 +1,2 @@
 
+ba1d13a821fcba35c3da96dca347834d5a9c1"},{"surveyId":52205446,"cpi":0.17,"ir":54,"estimatedLoi":3,"fullOrPartialMatch":"full","entryLink":"https://fusion.spectrumsurveys.com/start-session/649US0017?langIsoCode=en&surveyId=52205446&ts=1788885545764&maxLoi=6&matchApiId=kpDGn_Tr7HyvAGsYErgNs&211=111&212=34&229=32789&sPlacement=12&surveySig=f53ba839c3f9663a6b63f8e689a6540d760a2710a874b9856f0c571a23ad5a7a"}]}fadi@Windows4:~$
